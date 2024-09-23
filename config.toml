@@ -1,0 +1,8 @@
+blog_url = "http://192.168.56.11:1111"
+blog_dir = "/home/zack/source/server/blog"
+dest_dir = "/home/zack/source/server/editor/target"
+path_regex = "<!--relative path \\((.*)\\)-->"
+bind = "192.168.56.11:2222"
+url = "http://192.168.56.11:2222"
+build_command = "zola build"
+edit_template = "edit.html"
