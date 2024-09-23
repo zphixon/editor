@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head><title>revert to old revision</title></head>
+  <body>
+    <form method="POST" action="{{ action }}revert">
+      <select name="revision" id="select">
+      </select>
+      <button>submit</button>
+    </form>
+    <script>
+      let revisions = "{{ revisions }}".split("\n");
+      let select = document.getElementById("select");
+      for (let revision of revisions) {
+        var newel = document.createElement("option");
+        newel.innerHTML = revision;
+        select.appendChild(newel);
+      }
+      select.size = revisions.length;
+    </script>
+  </body>
+</html>

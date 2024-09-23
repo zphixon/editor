@@ -5,4 +5,8 @@ path_regex = "<!--relative path \\((.*)\\)-->"
 bind = "192.168.56.11:2222"
 url = "http://192.168.56.11:2222"
 build_command = "zola build"
-edit_template = "edit.html"
+edit_template = "templates/edit.html"
+create_revision = ["git", "commit", "-am"]
+revert_template = "templates/revert.html"
+list_revisions = ["git", "log", "--pretty=format:%h %ad %s"]
+revert_revision = ["git", "revert"]

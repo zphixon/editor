@@ -1,3 +1,4 @@
+use async_process::Command;
 use regex::Regex;
 use serde::{de::Visitor, Deserialize, Deserializer};
 use std::{collections::HashMap, fmt::Display, net::SocketAddr, path::PathBuf};
@@ -20,6 +21,10 @@ struct Config {
     path_regex: Regex,
     bind: SocketAddr,
     edit_template: PathBuf,
+    create_revision: Vec<String>,
+    revert_template: PathBuf,
+    list_revisions: Vec<String>,
+    revert_revision: Vec<String>,
 }
 
 fn parse_regex<'de, D>(de: D) -> Result<Regex, D::Error>
@@ -103,6 +108,25 @@ async fn path_to_file(
     Ok(actual_path)
 }
 
+async fn command_stdout(
+    config: &Config,
+    mut args: impl Iterator<Item = &str>,
+) -> Result<String, Response<String>> {
+    let mut command = Command::new(args.next().unwrap());
+    for arg in args {
+        command.arg(arg);
+    }
+
+    command.current_dir(&config.blog_dir);
+    let output = command.output().await.map_err(|err| five_hundred(err))?;
+
+    if !output.status.success() {
+        return Err(five_hundred(String::from_utf8_lossy(&output.stderr)));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into())
+}
+
 #[tokio::main]
 async fn main() {
     let config_buf = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
@@ -112,6 +136,70 @@ async fn main() {
             .unwrap()
             .into_boxed_str(),
     );
+
+    let revert_template: &'static str = Box::leak(
+        std::fs::read_to_string(&config.revert_template)
+            .unwrap()
+            .into_boxed_str(),
+    );
+
+    let revert_get =
+        warp::get()
+            .and(warp::path("revert"))
+            .and_then(move || async move {
+                let stdout =
+                    match command_stdout(config, config.list_revisions.iter().map(|s| s.as_str()))
+                        .await
+                    {
+                        Ok(stdout) => stdout,
+                        Err(fh) => return Ok(fh),
+                    };
+
+                Ok::<_, Rejection>(
+                    Response::builder()
+                        .body(
+                            revert_template
+                                .replace("{{ action }}", config.url.as_str())
+                                .replace(
+                                    "{{ revisions }}",
+                                    &stdout.replace("\n", "\\n").replace("\"", "\\\""),
+                                ),
+                        )
+                        .unwrap(),
+                )
+            });
+
+    let revert_post = warp::post()
+        .and(warp::path("revert"))
+        .and(warp::filters::body::form())
+        .and_then(move |form: HashMap<String, String>| async move {
+            let Some(revision_name) = form.get("revision") else {
+                return Ok(five_hundred("no revision from form?"));
+            };
+
+            let Some(revision) = revision_name.split_whitespace().next() else {
+                return Ok(five_hundred(format!(
+                    "no hash in revision {}",
+                    revision_name
+                )));
+            };
+
+            let stdout = match command_stdout(
+                config,
+                config
+                    .revert_revision
+                    .iter()
+                    .map(|s| s.as_str())
+                    .chain([revision]),
+            )
+            .await
+            {
+                Ok(out) => out,
+                Err(fh) => return Ok(fh),
+            };
+
+            Ok::<_, Rejection>(Response::builder().body(stdout).unwrap())
+        });
 
     let edit_post = warp::post()
         .and(warp::path("edit"))
@@ -134,9 +222,31 @@ async fn main() {
                     Err(_) => return Ok(five_hundred("couldn't write")),
                 }
 
+                let message = format!(
+                    "edit {}",
+                    actual_path
+                        .strip_prefix(&config.blog_dir)
+                        .unwrap()
+                        .display()
+                );
+
+                let stdout = match command_stdout(
+                    config,
+                    config
+                        .create_revision
+                        .iter()
+                        .map(|s| s.as_str())
+                        .chain([message.as_str()]),
+                )
+                .await
+                {
+                    Ok(stdout) => stdout,
+                    Err(fh) => return Ok(fh),
+                };
+
                 Ok::<_, Rejection>(
                     Response::builder()
-                        .body(format!("wrote to {}", actual_path.display()))
+                        .body(format!("wrote to {}\n{}", actual_path.display(), stdout))
                         .unwrap(),
                 )
             },
@@ -182,6 +292,9 @@ async fn main() {
     let route = edit_get
         .or(edit_post)
         .or(publish_get)
+        // .or(publish_post)
+        .or(revert_get)
+        .or(revert_post)
         .or(warp::any().and(warp::path::full()).map(|path: FullPath| {
             warp::reply::with_status(format!("404: {}", path.as_str()), StatusCode::NOT_FOUND)
         }));
