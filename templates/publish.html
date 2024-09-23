@@ -2,20 +2,24 @@
 <html>
   <head><title>create post</title></head>
   <body>
-    <form method="POST" action="{{ action }}publish">
-      <input type="text" name="filename" placeholder="FILENAME"></input>
-      <input type="text" name="note" placeholder="revision note"></input>
-      <button>submit</button>
+    <form id="theform" method="POST" action="{{ action }}publish">
+      <input type="text" id="filename" name="filename" placeholder="FILENAME"></input>
+      <input type="text" id="note" name="note" placeholder="revision note"></input>
+      <button id="submit">submit</button>
       <br>
-      <textarea id="textarea" name="content"></textarea>
+      <textarea id="textarea" name="content">+++
+title = ""
+description = ""
+date = DATE_REPLACEME
++++</textarea>
     </form>
-
     {{ draftwidget }}
-
     <script>
-      let dateEl = document.getElementById("date");
+      let theTextArea = document.getElementById("textarea");
       let now = new Date();
-      dateEl.value = new String(now.getFullYear()) + "-" + (now.getMonth() + 1) + "-" + now.getDate();
+      let month = now.getMonth() + 1;
+      let monthstr = month < 10 ? "0" + month : new String(month);
+      theTextArea.value = theTextArea.value.replace("DATE_REPLACEME", new String(now.getFullYear()) + "-" + monthstr + "-" + now.getDate());
     </script>
   </body>
 </html>

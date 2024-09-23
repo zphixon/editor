@@ -2,14 +2,13 @@
 <html>
   <head><title>edit post</title></head>
   <body>
-    <form method="POST" action="{{ action }}edit{{ path }}">
+    <form id="theform" method="POST" action="{{ action }}edit{{ path }}">
       <input type="text" name="note" placeholder="revision note"></input>
-      <button>submit</button>
+      <button id="submit">submit</button>
       <br>
       <textarea id="textarea" name="content">{{ content }}</textarea>
       <input type="checkbox" name="delete">delete?</input>
     </form>
-
     {{ draftwidget }}
   </body>
 </html>

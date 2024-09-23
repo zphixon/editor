@@ -4,6 +4,7 @@ use serde::{de::Visitor, Deserialize, Deserializer};
 use std::{
     collections::HashMap,
     fmt::Display,
+    future::Future,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
 };
@@ -17,23 +18,27 @@ use warp::{
 
 #[derive(Deserialize)]
 struct Config {
+    bind: SocketAddr,
     url: Url,
+
     blog_url: Url,
+    #[serde(deserialize_with = "parse_regex")]
+    path_regex: Regex,
     blog_dir: PathBuf,
     blog_build_dir: PathBuf,
     dest_dir: PathBuf,
+
     build_command: Vec<String>,
-    #[serde(deserialize_with = "parse_regex")]
-    path_regex: Regex,
-    bind: SocketAddr,
-    edit_template: PathBuf,
-    stage_revision: Vec<String>,
     create_revision: Vec<String>,
-    revert_template: PathBuf,
+    stage_revision: Vec<String>,
+    reset_command: Vec<String>,
     list_revisions: Vec<String>,
     revert_revision: Vec<String>,
-    publish_template: PathBuf,
+
     draft_template: PathBuf,
+    publish_template: PathBuf,
+    edit_template: PathBuf,
+    revert_template: PathBuf,
 }
 
 fn parse_regex<'de, D>(de: D) -> Result<Regex, D::Error>
@@ -111,7 +116,11 @@ async fn path_to_file(
         .map_err(Err)?;
 
     if !actual_path.starts_with(&config.blog_dir) {
-        println!("cheating bastard: {}", actual_path.display());
+        println!(
+            "cheating bastard: {} does NOT start with {}",
+            actual_path.display(),
+            config.blog_dir.display()
+        );
         return Err(Err(warp::reject()));
     }
 
@@ -137,7 +146,7 @@ async fn command_stdout(
             + "\nstdout:\n"
             + &String::from_utf8_lossy(&output.stdout)
             + "\nstderr:\n"
-            + &String::from_utf8_lossy(&output.stdout);
+            + &String::from_utf8_lossy(&output.stderr);
         return Err(five_hundred(all_output));
     }
 
@@ -182,6 +191,26 @@ async fn rebuild(config: &Config) -> Result<String, Response<String>> {
     Ok(stdout)
 }
 
+async fn reset_if_err(
+    config: &Config,
+    f: impl Future<Output = Result<String, Response<String>>>,
+) -> Result<String, Response<String>> {
+    match f.await {
+        Ok(ok) => Ok(ok),
+        Err(mut err) => {
+            match command_stdout(config, config.reset_command.iter().map(|s| s.as_str())).await {
+                Ok(ok) => err
+                    .body_mut()
+                    .push_str(&format!("\n\nhad to reset\n\n{}", ok)),
+                Err(err2) => err
+                    .body_mut()
+                    .push_str(&format!("\n\nfailed resetting\n\n{}", err2.body())),
+            }
+            Err(err)
+        }
+    }
+}
+
 async fn set_content_with_revision(
     config: &Config,
     actual_path: &Path,
@@ -215,15 +244,20 @@ async fn create_revision(
     message: String,
 ) -> Result<String, Response<String>> {
     let path = format!("{}", actual_path.display());
-    let mut stdout = command_stdout(
-        config,
-        config
-            .stage_revision
-            .iter()
-            .map(|s| s.as_str())
-            .chain([path.as_str()]),
-    )
-    .await?;
+
+    let mut stdout = rebuild(config).await?;
+
+    stdout.push_str(
+        &command_stdout(
+            config,
+            config
+                .stage_revision
+                .iter()
+                .map(|s| s.as_str())
+                .chain([path.as_str()]),
+        )
+        .await?,
+    );
 
     stdout.push_str(
         &command_stdout(
@@ -272,7 +306,18 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 #[tokio::main]
 async fn main() {
     let config_buf = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
-    let config: &'static Config = Box::leak(Box::new(toml::from_str(&config_buf).unwrap()));
+
+    let mut config: Config = toml::from_str(&config_buf).unwrap();
+    config.blog_dir = config.blog_dir.canonicalize().unwrap();
+    config.blog_build_dir = config.blog_build_dir.canonicalize().unwrap();
+    config.dest_dir = config.dest_dir.canonicalize().unwrap();
+    config.draft_template = config.draft_template.canonicalize().unwrap();
+    config.publish_template = config.publish_template.canonicalize().unwrap();
+    config.edit_template = config.edit_template.canonicalize().unwrap();
+    config.revert_template = config.revert_template.canonicalize().unwrap();
+
+    let config: &'static Config = Box::leak(Box::new(config));
+
     let edit_template: &'static str = Box::leak(
         std::fs::read_to_string(&config.edit_template)
             .unwrap()
@@ -376,10 +421,13 @@ async fn main() {
                         Ok(_) => {}
                         Err(err) => return Ok(five_hundred(err)),
                     };
-                    let stdout = match create_revision(
+                    let stdout = match reset_if_err(
                         config,
-                        &actual_path,
-                        format!("delete {}", actual_path.display()),
+                        create_revision(
+                            config,
+                            &actual_path,
+                            format!("delete {}", actual_path.display()),
+                        ),
                     )
                     .await
                     {
@@ -392,11 +440,14 @@ async fn main() {
                             .unwrap(),
                     )
                 } else {
-                    let stdout = match set_content_with_revision(
+                    let stdout = match reset_if_err(
                         config,
-                        actual_path.as_path(),
-                        content.as_str(),
-                        form.get("note").map(|s| s.as_str()),
+                        set_content_with_revision(
+                            config,
+                            actual_path.as_path(),
+                            content.as_str(),
+                            form.get("note").map(|s| s.as_str()),
+                        ),
                     )
                     .await
                     {
@@ -436,10 +487,11 @@ async fn main() {
                 .header("Content-Type", "text/html")
                 .body(
                     edit_template
+                        .replace("{{ draftwidget }}", draft_template)
                         .replace("{{ action }}", config.url.as_str())
+                        .replace("{{ request }}", "edit")
                         .replace("{{ content }}", &page_content)
                         .replace("{{ path }}", path_str)
-                        .replace("{{ draftwidget }}", draft_template)
                         .replace("{{ cookiename }}", "editdraft"),
                 )
                 .unwrap();
@@ -454,8 +506,9 @@ async fn main() {
                 .header("Content-Type", "text/html")
                 .body(
                     publish_template
-                        .replace("{{ action }}", config.url.as_str())
                         .replace("{{ draftwidget }}", draft_template)
+                        .replace("{{ request }}", "publish")
+                        .replace("{{ action }}", config.url.as_str())
                         .replace("{{ cookiename }}", "publishdraft"),
                 )
                 .unwrap();
@@ -466,6 +519,8 @@ async fn main() {
         .and(warp::path("publish"))
         .and(warp::filters::body::form())
         .and_then(move |form: HashMap<String, String>| async move {
+            println!("{:?}", form);
+
             let Some(filename) = form.get("filename") else {
                 // 400
                 return Ok(five_hundred("missing filename"));
@@ -481,11 +536,14 @@ async fn main() {
                 return Err(warp::reject());
             }
 
-            let stdout = match set_content_with_revision(
+            let stdout = match reset_if_err(
                 config,
-                actual_path.as_path(),
-                content.as_str(),
-                form.get("note").map(|s| s.as_str()),
+                set_content_with_revision(
+                    config,
+                    actual_path.as_path(),
+                    content.as_str(),
+                    form.get("note").map(|s| s.as_str()),
+                ),
             )
             .await
             {
