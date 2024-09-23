@@ -1,7 +1,12 @@
 use async_process::Command;
 use regex::Regex;
 use serde::{de::Visitor, Deserialize, Deserializer};
-use std::{collections::HashMap, fmt::Display, net::SocketAddr, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+};
 use url::Url;
 use warp::{
     filters::path::FullPath,
@@ -15,16 +20,20 @@ struct Config {
     url: Url,
     blog_url: Url,
     blog_dir: PathBuf,
+    blog_build_dir: PathBuf,
     dest_dir: PathBuf,
-    build_command: String,
+    build_command: Vec<String>,
     #[serde(deserialize_with = "parse_regex")]
     path_regex: Regex,
     bind: SocketAddr,
     edit_template: PathBuf,
+    stage_revision: Vec<String>,
     create_revision: Vec<String>,
     revert_template: PathBuf,
     list_revisions: Vec<String>,
     revert_revision: Vec<String>,
+    publish_template: PathBuf,
+    draft_template: PathBuf,
 }
 
 fn parse_regex<'de, D>(de: D) -> Result<Regex, D::Error>
@@ -102,6 +111,7 @@ async fn path_to_file(
         .map_err(Err)?;
 
     if !actual_path.starts_with(&config.blog_dir) {
+        println!("cheating bastard: {}", actual_path.display());
         return Err(Err(warp::reject()));
     }
 
@@ -110,10 +120,11 @@ async fn path_to_file(
 
 async fn command_stdout(
     config: &Config,
-    mut args: impl Iterator<Item = &str>,
+    args: impl Iterator<Item = &str>,
 ) -> Result<String, Response<String>> {
-    let mut command = Command::new(args.next().unwrap());
-    for arg in args {
+    let args = args.collect::<Vec<&str>>();
+    let mut command = Command::new(args[0]);
+    for arg in &args[1..] {
         command.arg(arg);
     }
 
@@ -121,10 +132,141 @@ async fn command_stdout(
     let output = command.output().await.map_err(|err| five_hundred(err))?;
 
     if !output.status.success() {
-        return Err(five_hundred(String::from_utf8_lossy(&output.stderr)));
+        let all_output = String::from("failed: ")
+            + &args.join(" ")
+            + "\nstdout:\n"
+            + &String::from_utf8_lossy(&output.stdout)
+            + "\nstderr:\n"
+            + &String::from_utf8_lossy(&output.stdout);
+        return Err(five_hundred(all_output));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into())
+}
+
+// https://stackoverflow.com/a/65192210
+async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> tokio::io::Result<()> {
+    tokio::fs::create_dir_all(&dst).await?;
+    let mut readdir = tokio::fs::read_dir(src).await?;
+    while let Some(entry) = readdir.next_entry().await? {
+        let ty = entry.file_type().await?;
+        if ty.is_dir() {
+            Box::pin(copy_dir_all(
+                entry.path(),
+                dst.as_ref().join(entry.file_name()),
+            ))
+            .await?;
+        } else {
+            tokio::fs::copy(entry.path(), dst.as_ref().join(entry.file_name())).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn rebuild(config: &Config) -> Result<String, Response<String>> {
+    let stdout = command_stdout(config, config.build_command.iter().map(|s| s.as_str())).await?;
+
+    if tokio::fs::try_exists(&config.dest_dir)
+        .await
+        .map_err(five_hundred)?
+    {
+        tokio::fs::remove_dir_all(&config.dest_dir)
+            .await
+            .map_err(five_hundred)?;
+    }
+
+    copy_dir_all(&config.blog_build_dir, &config.dest_dir)
+        .await
+        .map_err(five_hundred)?;
+
+    Ok(stdout)
+}
+
+async fn set_content_with_revision(
+    config: &Config,
+    actual_path: &Path,
+    content: &str,
+    note: Option<&str>,
+) -> Result<String, Response<String>> {
+    match tokio::fs::write(&actual_path, &content).await {
+        Ok(_) => {}
+        Err(_) => return Err(five_hundred("couldn't write")),
+    }
+
+    let message = format!(
+        "{}edit {}",
+        if let Some(note) = note {
+            format!("{} - ", note)
+        } else {
+            String::new()
+        },
+        actual_path
+            .strip_prefix(&config.blog_dir)
+            .unwrap()
+            .display()
+    );
+
+    create_revision(config, actual_path, message).await
+}
+
+async fn create_revision(
+    config: &Config,
+    actual_path: &Path,
+    message: String,
+) -> Result<String, Response<String>> {
+    let path = format!("{}", actual_path.display());
+    let mut stdout = command_stdout(
+        config,
+        config
+            .stage_revision
+            .iter()
+            .map(|s| s.as_str())
+            .chain([path.as_str()]),
+    )
+    .await?;
+
+    stdout.push_str(
+        &command_stdout(
+            config,
+            config
+                .create_revision
+                .iter()
+                .map(|s| s.as_str())
+                .chain([message.as_str()]),
+        )
+        .await?,
+    );
+
+    stdout.push_str(&rebuild(config).await?);
+
+    Ok(stdout)
+}
+
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
 }
 
 #[tokio::main]
@@ -139,6 +281,18 @@ async fn main() {
 
     let revert_template: &'static str = Box::leak(
         std::fs::read_to_string(&config.revert_template)
+            .unwrap()
+            .into_boxed_str(),
+    );
+
+    let publish_template: &'static str = Box::leak(
+        std::fs::read_to_string(&config.publish_template)
+            .unwrap()
+            .into_boxed_str(),
+    );
+
+    let draft_template: &'static str = Box::leak(
+        std::fs::read_to_string(&config.draft_template)
             .unwrap()
             .into_boxed_str(),
     );
@@ -217,38 +371,44 @@ async fn main() {
                     return Ok(five_hundred("no content from form?"));
                 };
 
-                match tokio::fs::write(&actual_path, &content).await {
-                    Ok(_) => {}
-                    Err(_) => return Ok(five_hundred("couldn't write")),
+                if form.get("delete").map(|s| s.as_str()) == Some("on") {
+                    match tokio::fs::remove_file(&actual_path).await {
+                        Ok(_) => {}
+                        Err(err) => return Ok(five_hundred(err)),
+                    };
+                    let stdout = match create_revision(
+                        config,
+                        &actual_path,
+                        format!("delete {}", actual_path.display()),
+                    )
+                    .await
+                    {
+                        Ok(stdout) => stdout,
+                        Err(err) => return Ok(err),
+                    };
+                    Ok::<_, Rejection>(
+                        Response::builder()
+                            .body(format!("deleted {}\n\n{}", actual_path.display(), stdout))
+                            .unwrap(),
+                    )
+                } else {
+                    let stdout = match set_content_with_revision(
+                        config,
+                        actual_path.as_path(),
+                        content.as_str(),
+                        form.get("note").map(|s| s.as_str()),
+                    )
+                    .await
+                    {
+                        Ok(stdout) => stdout,
+                        Err(err) => return Ok(err),
+                    };
+                    Ok::<_, Rejection>(
+                        Response::builder()
+                            .body(format!("wrote to {}\n\n{}", actual_path.display(), stdout))
+                            .unwrap(),
+                    )
                 }
-
-                let message = format!(
-                    "edit {}",
-                    actual_path
-                        .strip_prefix(&config.blog_dir)
-                        .unwrap()
-                        .display()
-                );
-
-                let stdout = match command_stdout(
-                    config,
-                    config
-                        .create_revision
-                        .iter()
-                        .map(|s| s.as_str())
-                        .chain([message.as_str()]),
-                )
-                .await
-                {
-                    Ok(stdout) => stdout,
-                    Err(fh) => return Ok(fh),
-                };
-
-                Ok::<_, Rejection>(
-                    Response::builder()
-                        .body(format!("wrote to {}\n{}", actual_path.display(), stdout))
-                        .unwrap(),
-                )
             },
         );
 
@@ -278,21 +438,72 @@ async fn main() {
                     edit_template
                         .replace("{{ action }}", config.url.as_str())
                         .replace("{{ content }}", &page_content)
-                        .replace("{{ path }}", path_str),
+                        .replace("{{ path }}", path_str)
+                        .replace("{{ draftwidget }}", draft_template)
+                        .replace("{{ cookiename }}", "editdraft"),
                 )
                 .unwrap();
 
             Ok::<_, Rejection>(response)
         });
 
-    let publish_get = warp::path("publish")
-        .and(warp::path::full())
-        .map(|path: FullPath| format!("publish {}", path.as_str()));
+    let publish_get = warp::get()
+        .and(warp::path("publish"))
+        .and_then(move || async move {
+            let response = Response::builder()
+                .header("Content-Type", "text/html")
+                .body(
+                    publish_template
+                        .replace("{{ action }}", config.url.as_str())
+                        .replace("{{ draftwidget }}", draft_template)
+                        .replace("{{ cookiename }}", "publishdraft"),
+                )
+                .unwrap();
+            Ok::<_, Rejection>(response)
+        });
+
+    let publish_post = warp::post()
+        .and(warp::path("publish"))
+        .and(warp::filters::body::form())
+        .and_then(move |form: HashMap<String, String>| async move {
+            let Some(filename) = form.get("filename") else {
+                // 400
+                return Ok(five_hundred("missing filename"));
+            };
+
+            let Some(content) = form.get("content") else {
+                return Ok(five_hundred("missing content"));
+            };
+
+            let actual_path = normalize_path(config.blog_dir.join(filename).as_path());
+            if !actual_path.starts_with(&config.blog_dir) {
+                println!("cheating bastard: {}", actual_path.display());
+                return Err(warp::reject());
+            }
+
+            let stdout = match set_content_with_revision(
+                config,
+                actual_path.as_path(),
+                content.as_str(),
+                form.get("note").map(|s| s.as_str()),
+            )
+            .await
+            {
+                Ok(stdout) => stdout,
+                Err(err) => return Ok(err),
+            };
+
+            Ok::<_, Rejection>(
+                Response::builder()
+                    .body(format!("wrote to {}\n\n{}", actual_path.display(), stdout))
+                    .unwrap(),
+            )
+        });
 
     let route = edit_get
         .or(edit_post)
         .or(publish_get)
-        // .or(publish_post)
+        .or(publish_post)
         .or(revert_get)
         .or(revert_post)
         .or(warp::any().and(warp::path::full()).map(|path: FullPath| {

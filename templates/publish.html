@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head><title>create post</title></head>
+  <body>
+    <form method="POST" action="{{ action }}publish">
+      <input type="text" name="filename" placeholder="FILENAME"></input>
+      <input type="text" name="note" placeholder="revision note"></input>
+      <button>submit</button>
+      <br>
+      <textarea id="textarea" name="content"></textarea>
+    </form>
+
+    {{ draftwidget }}
+
+    <script>
+      let dateEl = document.getElementById("date");
+      let now = new Date();
+      dateEl.value = new String(now.getFullYear()) + "-" + (now.getMonth() + 1) + "-" + now.getDate();
+    </script>
+  </body>
+</html>

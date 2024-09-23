@@ -1,12 +1,17 @@
 blog_url = "http://192.168.56.11:1111"
 blog_dir = "/home/zack/source/server/blog"
-dest_dir = "/home/zack/source/server/editor/target"
+blog_build_dir = "/home/zack/source/server/blog/public"
+dest_dir = "/home/zack/source/server/editor/target/blog"
 path_regex = "<!--relative path \\((.*)\\)-->"
 bind = "192.168.56.11:2222"
 url = "http://192.168.56.11:2222"
-build_command = "zola build"
+build_command = ["zola", "build"]
 edit_template = "templates/edit.html"
 create_revision = ["git", "commit", "-am"]
+stage_revision = ["git", "add"]
 revert_template = "templates/revert.html"
 list_revisions = ["git", "log", "--pretty=format:%h %ad %s"]
 revert_revision = ["git", "revert"]
+publish_template = "templates/publish.html"
+draft_template = "templates/draft.html"
+post_rebuild = ["git", "push"]
