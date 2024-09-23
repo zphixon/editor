@@ -62,49 +62,53 @@ where
     de.deserialize_str(RegexVisitor {})
 }
 
-fn five_hundred<F: Display>(body: F) -> Response<String> {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(format!("{}", body))
-        .unwrap()
+fn response_with_status<B: Display>(status: StatusCode, body: B) -> Response<String> {
+    Response::builder().status(status).body(format!("{}", body)).unwrap()
+}
+
+fn five_hundred<B: Display>(body: B) -> Response<String> {
+    response_with_status(StatusCode::INTERNAL_SERVER_ERROR, body)
+}
+
+fn four_hundred<B: Display>(body: B) -> Response<String> {
+    response_with_status(StatusCode::BAD_REQUEST, body)
 }
 
 async fn path_to_file(
     config: &Config,
     path: &str,
-) -> Result<PathBuf, Result<Response<String>, Rejection>> {
-    //let blog_url = format!("{}{}", config.blog_url, path).replace("//", "/");
+) -> Result<PathBuf, Response<String>> {
     let blog_url = config.blog_url.join(path).unwrap();
 
     let blog_response = match reqwest::get(blog_url).await {
         Ok(response) => response,
         Err(err) => {
-            return Err(Ok(five_hundred(err)));
+            return Err(five_hundred(err));
         }
     };
 
     if !blog_response.status().is_success() {
-        return Err(Ok(Response::builder()
+        return Err(Response::builder()
             .header("Content-Type", "text/html")
             .body(format!(
                 "<head><meta http-equiv=\"Refresh\" content=\"0; URL={}publish{}\"></head>",
                 config.url, path
             ))
-            .unwrap()));
+            .unwrap());
     }
 
     let blog_text = match blog_response.text().await {
         Ok(text) => text,
-        Err(err) => return Err(Ok(five_hundred(err))),
+        Err(err) => return Err(five_hundred(err)),
     };
 
     let relative_path = match config.path_regex.captures(&blog_text) {
         Some(captures) => captures,
         None => {
-            return Err(Ok(five_hundred(format!(
+            return Err(five_hundred(format!(
                 "nothing matching {} in {}",
                 config.path_regex, blog_text
-            ))))
+            )))
         }
     };
 
@@ -121,7 +125,7 @@ async fn path_to_file(
             actual_path.display(),
             config.blog_dir.display()
         );
-        return Err(Err(warp::reject()));
+        return Err(four_hundred("cheating bastard"));
     }
 
     Ok(actual_path)
@@ -409,7 +413,7 @@ async fn main() {
                 let path_str = path.as_str().strip_prefix("/edit").unwrap();
                 let actual_path = match path_to_file(config, path_str).await {
                     Ok(path) => path,
-                    Err(err) => return err,
+                    Err(err) => return Ok(err),
                 };
 
                 let Some(content) = form.get("content") else {
@@ -470,7 +474,7 @@ async fn main() {
             let path_str = path.as_str().strip_prefix("/edit").unwrap();
             let actual_path = match path_to_file(config, path_str).await {
                 Ok(path) => path,
-                Err(err) => return err,
+                Err(err) => return Ok(err),
             };
 
             let page_content = match tokio::fs::read_to_string(&actual_path).await {
