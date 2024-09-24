@@ -35,6 +35,7 @@ struct Config {
     reset_command: Vec<String>,
     list_revisions: Vec<String>,
     revert_revision: Vec<String>,
+    copy_command: Vec<String>,
 
     templates_dir: PathBuf,
 }
@@ -149,25 +150,6 @@ async fn command_stdout(
     Ok(String::from_utf8_lossy(&output.stdout).into())
 }
 
-// https://stackoverflow.com/a/65192210
-async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> tokio::io::Result<()> {
-    tokio::fs::create_dir_all(&dst).await?;
-    let mut readdir = tokio::fs::read_dir(src).await?;
-    while let Some(entry) = readdir.next_entry().await? {
-        let ty = entry.file_type().await?;
-        if ty.is_dir() {
-            Box::pin(copy_dir_all(
-                entry.path(),
-                dst.as_ref().join(entry.file_name()),
-            ))
-            .await?;
-        } else {
-            tokio::fs::copy(entry.path(), dst.as_ref().join(entry.file_name())).await?;
-        }
-    }
-    Ok(())
-}
-
 async fn rebuild(config: &Config) -> Result<String, Response<String>> {
     let blog_build_output =
         command_stdout(config, config.build_command.iter().map(|s| s.as_str())).await?;
@@ -180,10 +162,6 @@ async fn rebuild(config: &Config) -> Result<String, Response<String>> {
             .await
             .map_err(five_hundred)?;
     }
-
-    copy_dir_all(&config.blog_build_dir, &config.dest_dir)
-        .await
-        .map_err(five_hundred)?;
 
     Ok(blog_build_output)
 }
@@ -268,7 +246,16 @@ async fn create_revision(
         .await?,
     );
 
-    revision_output.push_str(&rebuild(config).await?);
+    revision_output.push_str(
+        &command_stdout(
+            config,
+            config.copy_command.iter().map(|s| s.as_str()).chain([
+                format!("{}", config.blog_build_dir.display()).as_str(),
+                format!("{}", config.dest_dir.display()).as_str(),
+            ]),
+        )
+        .await?,
+    );
 
     Ok(revision_output)
 }
