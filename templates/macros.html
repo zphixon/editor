@@ -1,0 +1,87 @@
+{% import "cookie.html" as cookie %}
+
+{% macro content_size_text_area(text_area_id, min_lines=10, min_cols=80) %}
+  <script>
+    let text_area = document.getElementById("{{ text_area_id }}");
+    let lines = text_area.value.split("\n");
+    let max_line = 0;
+    for (let line of lines) {
+      if (line.length > max_line) {
+        max_line = line.length;
+      }
+    }
+    text_area.rows = Math.max(lines.length, parseInt("{{ min_lines }}"));
+    text_area.cols = Math.max(max_line, parseInt("{{ min_cols }}"));
+  </script>
+{% endmacro %}
+
+{% macro draftwidget(textarea_id, cookie_name) %}
+  <button id="savedraft">save draft</button>
+  <button id="cleardraft">clear draft</button>
+  <span id="draftmessage" hidden></span>
+  {{ cookie::cookie() }}
+  <script>
+    function show_draft_message(msg) {
+      let draft_message = document.getElementById("draftmessage")
+      draft_message.innerHTML = msg;
+      draft_message.hidden = false;
+      setTimeout(() => {
+        draft_message.hidden = true;
+      }, 4000);
+    }
+
+    let textarea = document.getElementById("{{ textarea_id }}");
+
+    let maybe_draft = cookie.parse(document.cookie);
+    if (maybe_draft["{{ cookie_name }}"]) {
+      textarea.value = maybe_draft["{{ cookie_name }}"];
+      show_draft_message("loaded from draft");
+    }
+
+    document.getElementById("savedraft").onclick = () => {
+      document.cookie = cookie.serialize("{{ cookie_name }}", textarea.value);
+      show_draft_message("draft saved");
+    };
+
+    document.getElementById("cleardraft").onclick = () => {
+      document.cookie = cookie.serialize("{{ cookie_name }}", "");
+      window.location.reload(true);
+    };
+  </script>
+{% endmacro %}
+
+{% macro form_result(form_id, submit_id, remove_selected_from_id="") %}
+  <pre id="server_response"></pre>
+  <script>
+    let remove_selected_from_id = "{{ remove_selected_from_id | safe }}";
+
+    let form = document.getElementById("{{ form_id }}");
+    form.onsubmit = (event) => {
+      form.select
+      event.preventDefault();
+    };
+
+    document.getElementById("{{ submit_id }}").onclick = () => {
+      let server_response = document.getElementById("server_response");
+
+      fetch(form.action, {
+        method: "POST",
+        body: new URLSearchParams(new FormData(form)),
+      }).then((result) => {
+        console.log(result);
+
+        result.text().then((text) => {
+          server_response.innerHTML = text;
+        });
+
+        if (remove_selected_from_id != "") {
+          let select = document.getElementById(remove_selected_from_id);
+          select.options[select.selectedIndex].remove();
+        }
+      }, (error) => {
+        console.log(error);
+        server_response.innerHTML = JSON.stringify(error);
+      });
+    };
+  </script>
+{% endmacro %}

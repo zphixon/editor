@@ -16,10 +16,7 @@ revert_revision = ["git", "revert"]
 fix_revert = ["git", "revert", "--abort"]
 #post_rebuild = ["git", "push"]
 
-draft_template = "templates/draft.html"
-publish_template = "templates/publish.html"
-edit_template = "templates/edit.html"
-revert_template = "templates/revert.html"
+templates_dir = "templates"
 
 bind = "127.0.0.1:2222"
 url = "http://127.0.0.1:2222"

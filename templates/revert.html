@@ -1,21 +1,21 @@
+{% import "macros.html" as macros %}
 <!DOCTYPE html>
 <html>
   <head><title>revert to old revision</title></head>
   <body>
-    <form method="POST" action="{{ action }}revert">
+    <form method="POST" id="form">
       <select name="revision" id="select">
+        {% for revision in revisions %}
+          <option>{{ revision }}</option>
+        {% endfor %}
       </select>
-      <button>submit</button>
+      <br>
+      <button id="submit">submit</button>
     </form>
     <script>
-      let revisions = "{{ revisions }}".split("\n");
       let select = document.getElementById("select");
-      for (let revision of revisions) {
-        var newel = document.createElement("option");
-        newel.innerHTML = revision;
-        select.appendChild(newel);
-      }
-      select.size = revisions.length;
+      select.size = parseInt("{{ revisions | length }}");
     </script>
+    {{ macros::form_result(form_id="form", submit_id="submit", remove_selected_from_id="select") }}
   </body>
 </html>

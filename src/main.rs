@@ -8,6 +8,7 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
 };
+use tera::{Context, Tera};
 use url::Url;
 use warp::{
     filters::path::FullPath,
@@ -35,10 +36,7 @@ struct Config {
     list_revisions: Vec<String>,
     revert_revision: Vec<String>,
 
-    draft_template: PathBuf,
-    publish_template: PathBuf,
-    edit_template: PathBuf,
-    revert_template: PathBuf,
+    templates_dir: PathBuf,
 }
 
 fn parse_regex<'de, D>(de: D) -> Result<Regex, D::Error>
@@ -63,7 +61,10 @@ where
 }
 
 fn response_with_status<B: Display>(status: StatusCode, body: B) -> Response<String> {
-    Response::builder().status(status).body(format!("{}", body)).unwrap()
+    Response::builder()
+        .status(status)
+        .body(format!("{}", body))
+        .unwrap()
 }
 
 fn five_hundred<B: Display>(body: B) -> Response<String> {
@@ -74,10 +75,7 @@ fn four_hundred<B: Display>(body: B) -> Response<String> {
     response_with_status(StatusCode::BAD_REQUEST, body)
 }
 
-async fn path_to_file(
-    config: &Config,
-    path: &str,
-) -> Result<PathBuf, Response<String>> {
+async fn path_to_file(config: &Config, path: &str) -> Result<PathBuf, Response<String>> {
     let blog_url = config.blog_url.join(path).unwrap();
 
     let blog_response = match reqwest::get(blog_url).await {
@@ -97,10 +95,7 @@ async fn path_to_file(
             .unwrap());
     }
 
-    let blog_text = match blog_response.text().await {
-        Ok(text) => text,
-        Err(err) => return Err(five_hundred(err)),
-    };
+    let blog_text = blog_response.text().await.map_err(five_hundred)?;
 
     let relative_path = match config.path_regex.captures(&blog_text) {
         Some(captures) => captures,
@@ -114,10 +109,7 @@ async fn path_to_file(
 
     let mut page_path = config.blog_dir.clone();
     page_path.push(&relative_path[1]);
-    let actual_path = page_path
-        .canonicalize()
-        .map_err(|_| warp::reject())
-        .map_err(Err)?;
+    let actual_path = page_path.canonicalize().map_err(five_hundred)?;
 
     if !actual_path.starts_with(&config.blog_dir) {
         println!(
@@ -142,7 +134,7 @@ async fn command_stdout(
     }
 
     command.current_dir(&config.blog_dir);
-    let output = command.output().await.map_err(|err| five_hundred(err))?;
+    let output = command.output().await.map_err(five_hundred)?;
 
     if !output.status.success() {
         let all_output = String::from("failed: ")
@@ -177,7 +169,8 @@ async fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> tokio::io
 }
 
 async fn rebuild(config: &Config) -> Result<String, Response<String>> {
-    let stdout = command_stdout(config, config.build_command.iter().map(|s| s.as_str())).await?;
+    let blog_build_output =
+        command_stdout(config, config.build_command.iter().map(|s| s.as_str())).await?;
 
     if tokio::fs::try_exists(&config.dest_dir)
         .await
@@ -192,7 +185,7 @@ async fn rebuild(config: &Config) -> Result<String, Response<String>> {
         .await
         .map_err(five_hundred)?;
 
-    Ok(stdout)
+    Ok(blog_build_output)
 }
 
 async fn reset_if_err(
@@ -249,9 +242,9 @@ async fn create_revision(
 ) -> Result<String, Response<String>> {
     let path = format!("{}", actual_path.display());
 
-    let mut stdout = rebuild(config).await?;
+    let mut revision_output = rebuild(config).await?;
 
-    stdout.push_str(
+    revision_output.push_str(
         &command_stdout(
             config,
             config
@@ -263,7 +256,7 @@ async fn create_revision(
         .await?,
     );
 
-    stdout.push_str(
+    revision_output.push_str(
         &command_stdout(
             config,
             config
@@ -275,12 +268,12 @@ async fn create_revision(
         .await?,
     );
 
-    stdout.push_str(&rebuild(config).await?);
+    revision_output.push_str(&rebuild(config).await?);
 
-    Ok(stdout)
+    Ok(revision_output)
 }
 
-pub fn normalize_path(path: &Path) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     let mut components = path.components().peekable();
     let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
         components.next();
@@ -307,269 +300,277 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
+async fn get_revert(config: &Config, tera: &Tera) -> Result<Response<String>, Response<String>> {
+    let list_revert_output =
+        command_stdout(config, config.list_revisions.iter().map(|s| s.as_str())).await?;
+    let revisions = list_revert_output.split("\n").collect::<Vec<_>>();
+
+    let mut context = Context::new();
+    context.insert("revisions", &revisions);
+    let page = tera.render("revert.html", &context).map_err(five_hundred)?;
+
+    Ok(Response::builder().body(page).unwrap())
+}
+
+async fn get_edit(
+    config: &Config,
+    tera: &Tera,
+    path: FullPath,
+) -> Result<Response<String>, Response<String>> {
+    let path_str = path.as_str().strip_prefix("/edit").unwrap();
+    let actual_path = path_to_file(config, path_str).await?;
+
+    let page_content = match tokio::fs::read_to_string(&actual_path).await {
+        Ok(content) => content,
+        Err(_) => {
+            return Err(five_hundred(format!(
+                "couldn't read {}",
+                actual_path.display()
+            )))
+        }
+    };
+
+    let mut context = Context::new();
+    context.insert("content", &page_content);
+
+    let page = match tera.render("edit.html", &context) {
+        Ok(page) => page,
+        Err(err) => return Err(five_hundred(err)),
+    };
+
+    let response = Response::builder()
+        .header("Content-Type", "text/html")
+        .body(page)
+        .unwrap();
+
+    Ok(response)
+}
+
+async fn get_publish(_config: &Config, tera: &Tera) -> Result<Response<String>, Response<String>> {
+    let page = match tera.render("publish.html", &Context::new()) {
+        Ok(page) => page,
+        Err(err) => return Ok(five_hundred(err)),
+    };
+
+    let response = Response::builder()
+        .header("Content-Type", "text/html")
+        .body(page)
+        .unwrap();
+
+    Ok(response)
+}
+
+async fn post_revert(
+    config: &Config,
+    form: HashMap<String, String>,
+) -> Result<Response<String>, Response<String>> {
+    let Some(revision_name) = form.get("revision") else {
+        return Err(four_hundred("no revision from form?"));
+    };
+
+    let Some(revision) = revision_name.split_whitespace().next() else {
+        return Err(four_hundred(format!(
+            "no hash in revision {}",
+            revision_name
+        )));
+    };
+
+    let do_revert_output = command_stdout(
+        config,
+        config
+            .revert_revision
+            .iter()
+            .map(|s| s.as_str())
+            .chain([revision]),
+    )
+    .await?;
+
+    Ok(Response::builder().body(do_revert_output).unwrap())
+}
+
+async fn post_edit(
+    config: &Config,
+    path: FullPath,
+    form: HashMap<String, String>,
+) -> Result<Response<String>, Response<String>> {
+    let path_str = path.as_str().strip_prefix("/edit").unwrap();
+    let actual_path = path_to_file(config, path_str).await?;
+
+    let Some(content) = form.get("content") else {
+        return Err(four_hundred("no content from form?"));
+    };
+
+    if form.get("delete").map(|s| s.as_str()) == Some("on") {
+        match tokio::fs::remove_file(&actual_path).await {
+            Ok(_) => {}
+            Err(err) => return Err(five_hundred(err)),
+        };
+
+        let create_revision_output = reset_if_err(
+            config,
+            create_revision(
+                config,
+                &actual_path,
+                format!("delete {}", actual_path.display()),
+            ),
+        )
+        .await?;
+
+        Ok(Response::builder()
+            .body(format!(
+                "deleted {}\n\n{}",
+                actual_path.display(),
+                create_revision_output
+            ))
+            .unwrap())
+    } else {
+        let set_content_and_create_revision_output = reset_if_err(
+            config,
+            set_content_with_revision(
+                config,
+                actual_path.as_path(),
+                content.as_str(),
+                form.get("note").map(|s| s.as_str()),
+            ),
+        )
+        .await?;
+        Ok(Response::builder()
+            .body(format!(
+                "wrote to {}\n\n{}",
+                actual_path.display(),
+                set_content_and_create_revision_output
+            ))
+            .unwrap())
+    }
+}
+
+async fn post_publish(
+    config: &Config,
+    form: HashMap<String, String>,
+) -> Result<Response<String>, Response<String>> {
+    let Some(filename) = form.get("filename") else {
+        return Err(four_hundred("missing filename"));
+    };
+
+    let Some(content) = form.get("content") else {
+        return Err(four_hundred("missing content"));
+    };
+
+    let actual_path = normalize_path(config.blog_dir.join(filename).as_path());
+    if !actual_path.starts_with(&config.blog_dir) {
+        println!(
+            "cheating bastard: {} does NOT start with {}",
+            actual_path.display(),
+            config.blog_dir.display()
+        );
+        return Err(four_hundred("cheating bastard"));
+    }
+
+    if tokio::fs::try_exists(&actual_path)
+        .await
+        .map_err(five_hundred)?
+    {
+        return Err(four_hundred("already exists"));
+    }
+
+    let stdout = reset_if_err(
+        config,
+        set_content_with_revision(
+            config,
+            actual_path.as_path(),
+            content.as_str(),
+            form.get("note").map(|s| s.as_str()),
+        ),
+    )
+    .await?;
+
+    Ok(Response::builder()
+        .body(format!("wrote to {}\n\n{}", actual_path.display(), stdout))
+        .unwrap())
+}
+
 #[tokio::main]
 async fn main() {
     let config_buf = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
-
     let mut config: Config = toml::from_str(&config_buf).unwrap();
     config.blog_dir = config.blog_dir.canonicalize().unwrap();
     config.blog_build_dir = config.blog_build_dir.canonicalize().unwrap();
     config.dest_dir = config.dest_dir.canonicalize().unwrap();
-    config.draft_template = config.draft_template.canonicalize().unwrap();
-    config.publish_template = config.publish_template.canonicalize().unwrap();
-    config.edit_template = config.edit_template.canonicalize().unwrap();
-    config.revert_template = config.revert_template.canonicalize().unwrap();
-
+    config.templates_dir = config.templates_dir.canonicalize().unwrap();
     let config: &'static Config = Box::leak(Box::new(config));
 
-    let edit_template: &'static str = Box::leak(
-        std::fs::read_to_string(&config.edit_template)
-            .unwrap()
-            .into_boxed_str(),
-    );
+    let templates_pattern = config.templates_dir.join("**").join("*.html");
+    let tera: &'static _ = Box::leak(Box::new(
+        Tera::new(&format!("{}", templates_pattern.display())).unwrap(),
+    ));
 
-    let revert_template: &'static str = Box::leak(
-        std::fs::read_to_string(&config.revert_template)
-            .unwrap()
-            .into_boxed_str(),
-    );
-
-    let publish_template: &'static str = Box::leak(
-        std::fs::read_to_string(&config.publish_template)
-            .unwrap()
-            .into_boxed_str(),
-    );
-
-    let draft_template: &'static str = Box::leak(
-        std::fs::read_to_string(&config.draft_template)
-            .unwrap()
-            .into_boxed_str(),
-    );
-
-    let revert_get =
-        warp::get()
-            .and(warp::path("revert"))
-            .and_then(move || async move {
-                let stdout =
-                    match command_stdout(config, config.list_revisions.iter().map(|s| s.as_str()))
-                        .await
-                    {
-                        Ok(stdout) => stdout,
-                        Err(fh) => return Ok(fh),
-                    };
-
-                Ok::<_, Rejection>(
-                    Response::builder()
-                        .body(
-                            revert_template
-                                .replace("{{ action }}", config.url.as_str())
-                                .replace(
-                                    "{{ revisions }}",
-                                    &stdout.replace("\n", "\\n").replace("\"", "\\\""),
-                                ),
-                        )
-                        .unwrap(),
-                )
-            });
-
-    let revert_post = warp::post()
+    let get_revert = warp::get()
+        .and(warp::path("revert"))
+        .and_then(move || async move {
+            // moar keywords
+            match get_revert(config, tera).await {
+                Ok(ok) => Ok::<_, Rejection>(ok),
+                Err(err) => Ok(err),
+            }
+        });
+    let post_revert = warp::post()
         .and(warp::path("revert"))
         .and(warp::filters::body::form())
         .and_then(move |form: HashMap<String, String>| async move {
-            let Some(revision_name) = form.get("revision") else {
-                return Ok(five_hundred("no revision from form?"));
-            };
-
-            let Some(revision) = revision_name.split_whitespace().next() else {
-                return Ok(five_hundred(format!(
-                    "no hash in revision {}",
-                    revision_name
-                )));
-            };
-
-            let stdout = match command_stdout(
-                config,
-                config
-                    .revert_revision
-                    .iter()
-                    .map(|s| s.as_str())
-                    .chain([revision]),
-            )
-            .await
-            {
-                Ok(out) => out,
-                Err(fh) => return Ok(fh),
-            };
-
-            Ok::<_, Rejection>(Response::builder().body(stdout).unwrap())
+            match post_revert(config, form).await {
+                Ok(ok) => Ok::<_, Rejection>(ok),
+                Err(err) => Ok(err),
+            }
         });
 
-    let edit_post = warp::post()
+    let get_edit = warp::get()
+        .and(warp::path("edit"))
+        .and(warp::path::full())
+        .and_then(move |path| async move {
+            match get_edit(config, tera, path).await {
+                Ok(ok) => Ok::<_, Rejection>(ok),
+                Err(err) => Ok(err),
+            }
+        });
+    let post_edit = warp::post()
         .and(warp::path("edit"))
         .and(warp::path::full())
         .and(warp::filters::body::form())
         .and_then(
             move |path: FullPath, form: HashMap<String, String>| async move {
-                let path_str = path.as_str().strip_prefix("/edit").unwrap();
-                let actual_path = match path_to_file(config, path_str).await {
-                    Ok(path) => path,
-                    Err(err) => return Ok(err),
-                };
-
-                let Some(content) = form.get("content") else {
-                    return Ok(five_hundred("no content from form?"));
-                };
-
-                if form.get("delete").map(|s| s.as_str()) == Some("on") {
-                    match tokio::fs::remove_file(&actual_path).await {
-                        Ok(_) => {}
-                        Err(err) => return Ok(five_hundred(err)),
-                    };
-                    let stdout = match reset_if_err(
-                        config,
-                        create_revision(
-                            config,
-                            &actual_path,
-                            format!("delete {}", actual_path.display()),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(stdout) => stdout,
-                        Err(err) => return Ok(err),
-                    };
-                    Ok::<_, Rejection>(
-                        Response::builder()
-                            .body(format!("deleted {}\n\n{}", actual_path.display(), stdout))
-                            .unwrap(),
-                    )
-                } else {
-                    let stdout = match reset_if_err(
-                        config,
-                        set_content_with_revision(
-                            config,
-                            actual_path.as_path(),
-                            content.as_str(),
-                            form.get("note").map(|s| s.as_str()),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(stdout) => stdout,
-                        Err(err) => return Ok(err),
-                    };
-                    Ok::<_, Rejection>(
-                        Response::builder()
-                            .body(format!("wrote to {}\n\n{}", actual_path.display(), stdout))
-                            .unwrap(),
-                    )
+                match post_edit(config, path, form).await {
+                    Ok(ok) => Ok::<_, Rejection>(ok),
+                    Err(err) => Ok(err),
                 }
             },
         );
 
-    let edit_get = warp::get()
-        .and(warp::path("edit"))
-        .and(warp::path::full())
-        .and_then(move |path: FullPath| async move {
-            let path_str = path.as_str().strip_prefix("/edit").unwrap();
-            let actual_path = match path_to_file(config, path_str).await {
-                Ok(path) => path,
-                Err(err) => return Ok(err),
-            };
-
-            let page_content = match tokio::fs::read_to_string(&actual_path).await {
-                Ok(content) => content,
-                Err(_) => {
-                    return Ok(five_hundred(format!(
-                        "couldn't read {}",
-                        actual_path.display()
-                    )))
-                }
-            };
-
-            let response = Response::builder()
-                .header("Content-Type", "text/html")
-                .body(
-                    edit_template
-                        .replace("{{ draftwidget }}", draft_template)
-                        .replace("{{ action }}", config.url.as_str())
-                        .replace("{{ request }}", "edit")
-                        .replace("{{ content }}", &page_content)
-                        .replace("{{ path }}", path_str)
-                        .replace("{{ cookiename }}", "editdraft"),
-                )
-                .unwrap();
-
-            Ok::<_, Rejection>(response)
-        });
-
-    let publish_get = warp::get()
+    let get_publish = warp::get()
         .and(warp::path("publish"))
         .and_then(move || async move {
-            let response = Response::builder()
-                .header("Content-Type", "text/html")
-                .body(
-                    publish_template
-                        .replace("{{ draftwidget }}", draft_template)
-                        .replace("{{ request }}", "publish")
-                        .replace("{{ action }}", config.url.as_str())
-                        .replace("{{ cookiename }}", "publishdraft"),
-                )
-                .unwrap();
-            Ok::<_, Rejection>(response)
+            match get_publish(config, tera).await {
+                Ok(ok) => Ok::<_, Rejection>(ok),
+                Err(err) => Ok(err),
+            }
         });
-
-    let publish_post = warp::post()
+    let post_publish = warp::post()
         .and(warp::path("publish"))
         .and(warp::filters::body::form())
         .and_then(move |form: HashMap<String, String>| async move {
-            println!("{:?}", form);
-
-            let Some(filename) = form.get("filename") else {
-                // 400
-                return Ok(five_hundred("missing filename"));
-            };
-
-            let Some(content) = form.get("content") else {
-                return Ok(five_hundred("missing content"));
-            };
-
-            let actual_path = normalize_path(config.blog_dir.join(filename).as_path());
-            if !actual_path.starts_with(&config.blog_dir) {
-                println!("cheating bastard: {}", actual_path.display());
-                return Err(warp::reject());
+            match post_publish(config, form).await {
+                Ok(ok) => Ok::<_, Rejection>(ok),
+                Err(err) => Ok(err),
             }
-
-            let stdout = match reset_if_err(
-                config,
-                set_content_with_revision(
-                    config,
-                    actual_path.as_path(),
-                    content.as_str(),
-                    form.get("note").map(|s| s.as_str()),
-                ),
-            )
-            .await
-            {
-                Ok(stdout) => stdout,
-                Err(err) => return Ok(err),
-            };
-
-            Ok::<_, Rejection>(
-                Response::builder()
-                    .body(format!("wrote to {}\n\n{}", actual_path.display(), stdout))
-                    .unwrap(),
-            )
         });
 
-    let route = edit_get
-        .or(edit_post)
-        .or(publish_get)
-        .or(publish_post)
-        .or(revert_get)
-        .or(revert_post)
+    let route = get_revert
+        .or(post_revert)
+        .or(get_edit)
+        .or(post_edit)
+        .or(get_publish)
+        .or(post_publish)
         .or(warp::any().and(warp::path::full()).map(|path: FullPath| {
-            warp::reply::with_status(format!("404: {}", path.as_str()), StatusCode::NOT_FOUND)
+            response_with_status(StatusCode::NOT_FOUND, format!("404: {}", path.as_str()))
         }));
 
     let server = warp::serve(route);

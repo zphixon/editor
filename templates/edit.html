@@ -1,14 +1,20 @@
+{% import "macros.html" as macros %}
 <!DOCTYPE html>
 <html>
-  <head><title>edit post</title></head>
+  <head>
+    <meta charset="utf8">
+    <title>edit post</title>
+  </head>
   <body>
-    <form id="theform" method="POST" action="{{ action }}edit{{ path }}">
+    <form method="POST" id="edit_form">
       <input type="text" name="note" placeholder="revision note"></input>
       <button id="submit">submit</button>
       <br>
-      <textarea id="textarea" name="content">{{ content }}</textarea>
+      <textarea id="textarea" name="content">{{ content | safe }}</textarea>
       <input type="checkbox" name="delete">delete?</input>
     </form>
-    {{ draftwidget }}
+    {{ macros::draftwidget(textarea_id="edit_form", cookie_name="edit_draft") }}
+    {{ macros::form_result(form_id="edit_form", submit_id="submit") }}
+    {{ macros::content_size_text_area(text_area_id="textarea") }}
   </body>
 </html>
